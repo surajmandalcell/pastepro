@@ -4,8 +4,10 @@
 #ifdef GDK_WINDOWING_X11
 #include <gdk/gdkx.h>
 #endif
+#include <gdk-pixbuf/gdk-pixbuf.h>
 
 #include "flutter/generated_plugin_registrant.h"
+#include "tray_plugin.h"
 
 struct _MyApplication {
   GtkApplication parent_instance;
@@ -26,42 +28,27 @@ static void my_application_activate(GApplication* application) {
   GtkWindow* window =
       GTK_WINDOW(gtk_application_window_new(GTK_APPLICATION(application)));
 
-  // Use a header bar when running in GNOME as this is the common style used
-  // by applications and is the setup most users will be using (e.g. Ubuntu
-  // desktop).
-  // If running on X and not using GNOME then just use a traditional title bar
-  // in case the window manager does more exotic layout, e.g. tiling.
-  // If running on Wayland assume the header bar will work (may need changing
-  // if future cases occur).
-  gboolean use_header_bar = TRUE;
-#ifdef GDK_WINDOWING_X11
-  GdkScreen* screen = gtk_window_get_screen(window);
-  if (GDK_IS_X11_SCREEN(screen)) {
-    const gchar* wm_name = gdk_x11_screen_get_window_manager_name(screen);
-    if (g_strcmp0(wm_name, "GNOME Shell") != 0) {
-      use_header_bar = FALSE;
-    }
-  }
-#endif
-  if (use_header_bar) {
-    GtkHeaderBar* header_bar = GTK_HEADER_BAR(gtk_header_bar_new());
-    gtk_widget_show(GTK_WIDGET(header_bar));
-    gtk_header_bar_set_title(header_bar, "pastepro");
-    gtk_header_bar_set_show_close_button(header_bar, TRUE);
-    gtk_window_set_titlebar(window, GTK_WIDGET(header_bar));
-  } else {
-    gtk_window_set_title(window, "pastepro");
-  }
+  gtk_window_set_decorated(window, FALSE);
+  gtk_window_set_resizable(window, FALSE);
+  gtk_window_set_title(window, "📋 pastepro");
 
-  gtk_window_set_default_size(window, 1280, 720);
+  const gchar* icon_path = "assets/icons/clipboard.png";
+  g_autoptr(GError) icon_error = nullptr;
+  GdkPixbuf* icon_pixbuf = gdk_pixbuf_new_from_file(icon_path, &icon_error);
+  if (icon_pixbuf != nullptr) {
+    gtk_window_set_icon(window, icon_pixbuf);
+    g_object_unref(icon_pixbuf);
+  } else if (icon_error != nullptr) {
+    g_warning("Failed to load application icon: %s", icon_error->message);
+  }
 
   g_autoptr(FlDartProject) project = fl_dart_project_new();
   fl_dart_project_set_dart_entrypoint_arguments(project, self->dart_entrypoint_arguments);
 
   FlView* view = fl_view_new(project);
   GdkRGBA background_color;
-  // Background defaults to black, override it here if necessary, e.g. #00000000 for transparent.
-  gdk_rgba_parse(&background_color, "#000000");
+  // Render Flutter content over a transparent surface for overlay effect.
+  gdk_rgba_parse(&background_color, "#00000000");
   fl_view_set_background_color(view, &background_color);
   gtk_widget_show(GTK_WIDGET(view));
   gtk_container_add(GTK_CONTAINER(window), GTK_WIDGET(view));
@@ -73,7 +60,12 @@ static void my_application_activate(GApplication* application) {
 
   fl_register_plugins(FL_PLUGIN_REGISTRY(view));
 
-  gtk_widget_grab_focus(GTK_WIDGET(view));
+  g_autoptr(FlPluginRegistrar) tray_registrar =
+      fl_plugin_registry_get_registrar_for_plugin(FL_PLUGIN_REGISTRY(view),
+                                                  "PasteproTrayPlugin");
+  pastepro_tray_plugin_register_with_registrar(tray_registrar);
+
+  gtk_window_set_focus(window, nullptr);
 }
 
 // Implements GApplication::local_command_line.

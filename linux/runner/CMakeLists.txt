@@ -9,6 +9,7 @@ project(runner LANGUAGES CXX)
 add_executable(${BINARY_NAME}
   "main.cc"
   "my_application.cc"
+  "tray_plugin.cc"
   "${FLUTTER_MANAGED_DIR}/generated_plugin_registrant.cc"
 )
 
@@ -22,5 +23,11 @@ add_definitions(-DAPPLICATION_ID="${APPLICATION_ID}")
 # Add dependency libraries. Add any application-specific dependencies here.
 target_link_libraries(${BINARY_NAME} PRIVATE flutter)
 target_link_libraries(${BINARY_NAME} PRIVATE PkgConfig::GTK)
+target_link_libraries(${BINARY_NAME} PRIVATE ${APPINDICATOR_LIBRARIES})
+
+target_compile_options(${BINARY_NAME} PRIVATE ${APPINDICATOR_CFLAGS_OTHER})
 
 target_include_directories(${BINARY_NAME} PRIVATE "${CMAKE_SOURCE_DIR}")
+target_include_directories(${BINARY_NAME} PRIVATE ${APPINDICATOR_INCLUDE_DIRS})
+
+target_compile_options(${BINARY_NAME} PRIVATE -Wno-deprecated-declarations -Wno-error=deprecated-declarations)
