@@ -5,12 +5,16 @@ import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:hotkey_manager/hotkey_manager.dart';
+import 'package:path/path.dart' as path;
+import 'package:path_provider/path_provider.dart';
 import 'package:screen_retriever/screen_retriever.dart';
 import 'package:window_manager/window_manager.dart';
 
-const double _overlayHeightRatio = 0.20;
+import 'database.dart';
+
+const double _overlayHeightRatio = 0.60;
 final HotKey _toggleHotKey = HotKey(
-  key: PhysicalKeyboardKey.keyV,
+  key: PhysicalKeyboardKey.backslash,
   modifiers: [HotKeyModifier.control, HotKeyModifier.shift],
   scope: HotKeyScope.system,
 );
@@ -19,11 +23,16 @@ Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await windowManager.ensureInitialized();
 
+  // Single instance check
+  if (!await _ensureSingleInstance()) {
+    exit(0);
+  }
+
   final display = await screenRetriever.getPrimaryDisplay();
   final usableSize = display.visibleSize ?? display.size;
   final origin = display.visiblePosition ?? Offset.zero;
   final double overlayHeight = math.max(
-    360,
+    480,
     (usableSize.height * _overlayHeightRatio).roundToDouble(),
   );
 
@@ -39,8 +48,8 @@ Future<void> main() async {
 
   windowManager.waitUntilReadyToShow(windowOptions, () async {
     await windowManager.setResizable(false);
-    await windowManager.setHasShadow(false);
     await windowManager.setSkipTaskbar(true);
+    await windowManager.setAlignment(Alignment.bottomCenter);
 
     final double y = origin.dy + usableSize.height - overlayHeight;
     await windowManager.setPosition(Offset(origin.dx, y));
@@ -50,6 +59,40 @@ Future<void> main() async {
   runApp(PasteProApp(
     overlayHeight: overlayHeight,
   ));
+}
+
+Future<bool> _ensureSingleInstance() async {
+  try {
+    final appDir = await getApplicationDocumentsDirectory();
+    final lockFile = File(path.join(appDir.path, 'pastepro', '.lock'));
+
+    if (await lockFile.exists()) {
+      // Try to read PID from lock file
+      final pidStr = await lockFile.readAsString();
+      final pid = int.tryParse(pidStr);
+
+      if (pid != null) {
+        // Check if process is still running
+        final result = await Process.run('kill', ['-0', pid.toString()]);
+        if (result.exitCode == 0) {
+          // Process exists, kill it
+          await Process.run('kill', [pid.toString()]);
+          await Future.delayed(const Duration(milliseconds: 500));
+        }
+      }
+
+      await lockFile.delete();
+    }
+
+    // Create lock file with our PID
+    await lockFile.parent.create(recursive: true);
+    await lockFile.writeAsString(pid.toString());
+
+    return true;
+  } catch (e) {
+    debugPrint('Single instance check failed: $e');
+    return true; // Continue anyway
+  }
 }
 
 class PasteProApp extends StatefulWidget {
@@ -65,27 +108,120 @@ class PasteProApp extends StatefulWidget {
 }
 
 class _PasteProAppState extends State<PasteProApp>
-    with WindowListener {
+    with SingleTickerProviderStateMixin, WindowListener {
   bool _isVisible = false;
+  late final AnimationController _animationController;
+  late final Animation<double> _slideAnimation;
+  late final Animation<double> _fadeAnimation;
   late final VoidCallback _trayActivateHandler = () => unawaited(_toggleOverlay());
+  Timer? _clipboardMonitor;
 
   @override
   void initState() {
     super.initState();
+
+    _animationController = AnimationController(
+      duration: const Duration(milliseconds: 280),
+      vsync: this,
+    );
+
+    _slideAnimation = CurvedAnimation(
+      parent: _animationController,
+      curve: Curves.easeOutCubic,
+    );
+
+    _fadeAnimation = CurvedAnimation(
+      parent: _animationController,
+      curve: Curves.easeOut,
+    );
+
     windowManager.addListener(this);
     unawaited(_initialiseTray());
     unawaited(_registerHotKey());
+    _setupSignalHandling();
+    _startClipboardMonitoring();
   }
 
   @override
   void dispose() {
+    _clipboardMonitor?.cancel();
+    _animationController.dispose();
     windowManager.removeListener(this);
     unawaited(hotKeyManager.unregister(_toggleHotKey));
     TrayBridge.instance.removeActivateHandler(_trayActivateHandler);
+    _removeLockFile();
     super.dispose();
   }
 
+  void _startClipboardMonitoring() {
+    _clipboardMonitor = Timer.periodic(const Duration(seconds: 2), (timer) {
+      _checkClipboard();
+    });
+  }
+
+  Future<void> _checkClipboard() async {
+    try {
+      final data = await Clipboard.getData(Clipboard.kTextPlain);
+      if (data != null && data.text != null && data.text!.isNotEmpty) {
+        await _saveClipboardItem(data.text!, 'text');
+      }
+    } catch (e) {
+      // Clipboard access might fail, ignore
+      debugPrint('Clipboard check error: $e');
+    }
+  }
+
+  String? _lastClipboardContent;
+
+  Future<void> _saveClipboardItem(String content, String type) async {
+    // Avoid duplicates
+    if (content == _lastClipboardContent) return;
+    _lastClipboardContent = content;
+
+    await ClipboardDatabase.instance.insertItem({
+      'content': content,
+      'type': type,
+      'category': _categorizeContent(content),
+      'source_app': 'Unknown',
+      'created_at': DateTime.now().millisecondsSinceEpoch,
+    });
+  }
+
+  String _categorizeContent(String content) {
+    if (content.startsWith('http://') || content.startsWith('https://')) {
+      return 'links';
+    } else if (content.contains('struct') || content.contains('function') || content.contains('class')) {
+      return 'code';
+    } else if (content.length > 200) {
+      return 'notes';
+    }
+    return 'history';
+  }
+
+  Future<void> _removeLockFile() async {
+    try {
+      final appDir = await getApplicationDocumentsDirectory();
+      final lockFile = File(path.join(appDir.path, 'pastepro', '.lock'));
+      if (await lockFile.exists()) {
+        await lockFile.delete();
+      }
+    } catch (e) {
+      debugPrint('Failed to remove lock file: $e');
+    }
+  }
+
+  void _setupSignalHandling() {
+    ProcessSignal.sigusr1.watch().listen((_) {
+      unawaited(_toggleOverlay());
+    });
+  }
+
   Future<void> _registerHotKey() async {
+    if (Platform.environment['XDG_SESSION_TYPE'] == 'wayland') {
+      debugPrint('Wayland detected - using signal-based toggle (Ctrl+Shift+\\)');
+      return;
+    }
+
     await hotKeyManager.unregisterAll();
     await hotKeyManager.register(
       _toggleHotKey,
@@ -102,7 +238,7 @@ class _PasteProAppState extends State<PasteProApp>
       if (await iconFile.exists()) {
         await TrayBridge.instance.setIcon(
           iconFile.absolute.path,
-          tooltip: 'PastePro • Ctrl+Shift+V',
+          tooltip: 'PastePro • Ctrl+Shift+\\',
         );
       }
       TrayBridge.instance.addActivateHandler(_trayActivateHandler);
@@ -114,14 +250,15 @@ class _PasteProAppState extends State<PasteProApp>
   Future<void> _toggleOverlay() async {
     final bool currentlyVisible = await windowManager.isVisible();
     if (currentlyVisible) {
+      await _animationController.reverse();
       await windowManager.hide();
       await windowManager.setAlwaysOnTop(false);
     } else {
       await _ensureBounds();
-      await windowManager.setAlwaysOnTop(true);
       await windowManager.show();
+      await windowManager.setAlwaysOnTop(true);
       await windowManager.focus();
-      await windowManager.setAlwaysOnTop(false);
+      await _animationController.forward();
     }
     if (mounted) {
       setState(() => _isVisible = !currentlyVisible);
@@ -133,6 +270,7 @@ class _PasteProAppState extends State<PasteProApp>
     final usableSize = display.visibleSize ?? display.size;
     final origin = display.visiblePosition ?? Offset.zero;
     final double overlayHeight = widget.overlayHeight;
+
     await windowManager.setSize(
       Size(usableSize.width, overlayHeight),
       animate: false,
@@ -141,14 +279,17 @@ class _PasteProAppState extends State<PasteProApp>
       Offset(origin.dx, origin.dy + usableSize.height - overlayHeight),
       animate: false,
     );
+    await windowManager.setAlignment(Alignment.bottomCenter);
   }
 
   @override
   void onWindowBlur() {
-    unawaited(windowManager.hide());
-    if (mounted) {
-      setState(() => _isVisible = false);
-    }
+    unawaited(_animationController.reverse().then((_) async {
+      await windowManager.hide();
+      if (mounted) {
+        setState(() => _isVisible = false);
+      }
+    }));
   }
 
   @override
@@ -167,111 +308,388 @@ class _PasteProAppState extends State<PasteProApp>
       ),
       home: Scaffold(
         backgroundColor: Colors.transparent,
-        body: Stack(
-          children: [
-            Align(
+        body: AnimatedBuilder(
+          animation: _animationController,
+          builder: (context, child) {
+            return Align(
               alignment: Alignment.bottomCenter,
-              child: Container(
-                width: double.infinity,
-                height: widget.overlayHeight,
-                decoration: BoxDecoration(
-                  color: const Color(0xFF101720).withOpacity(0.96),
-                  borderRadius: const BorderRadius.vertical(top: Radius.circular(18)),
-                  border: Border.all(color: Colors.white12, width: 1.2),
-                  boxShadow: const [
-                    BoxShadow(
-                      color: Colors.black54,
-                      blurRadius: 18,
-                      spreadRadius: 2,
-                      offset: Offset(0, -4),
-                    ),
-                  ],
+              child: Transform.translate(
+                offset: Offset(0, (1 - _slideAnimation.value) * 50),
+                child: Opacity(
+                  opacity: _fadeAnimation.value,
+                  child: child,
                 ),
-                padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 20),
-                child: const _OverlayContent(),
               ),
-            ),
-            Positioned(
-              right: 24,
-              bottom: 28,
-              child: AnimatedOpacity(
-                opacity: _isVisible ? 1 : 0.0,
-                duration: const Duration(milliseconds: 180),
-                child: const _ShortcutBadge(),
+            );
+          },
+          child: Container(
+            width: double.infinity,
+            height: widget.overlayHeight,
+            decoration: BoxDecoration(
+              gradient: LinearGradient(
+                begin: Alignment.topCenter,
+                end: Alignment.bottomCenter,
+                colors: [
+                  const Color(0xFF1A1F2E).withOpacity(0.98),
+                  const Color(0xFF0F1419).withOpacity(0.98),
+                ],
               ),
+              borderRadius: const BorderRadius.vertical(top: Radius.circular(24)),
+              border: Border.all(color: Colors.white.withOpacity(0.08), width: 1),
+              boxShadow: [
+                BoxShadow(
+                  color: Colors.black.withOpacity(0.5),
+                  blurRadius: 40,
+                  spreadRadius: 0,
+                  offset: const Offset(0, -10),
+                ),
+              ],
             ),
-          ],
+            padding: const EdgeInsets.fromLTRB(32, 28, 32, 24),
+            child: const _OverlayContent(),
+          ),
         ),
       ),
     );
   }
 }
 
-class _ShortcutBadge extends StatelessWidget {
-  const _ShortcutBadge();
+class _OverlayContent extends StatefulWidget {
+  const _OverlayContent();
 
   @override
-  Widget build(BuildContext context) {
-    final Color borderColor = Colors.white.withOpacity(0.08);
-    return Container(
-      decoration: BoxDecoration(
-        color: Colors.white.withOpacity(0.05),
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: borderColor),
-      ),
-      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: const [
-          Icon(Icons.keyboard_command_key, size: 18, color: Colors.white70),
-          SizedBox(width: 8),
-          Text('Ctrl + Shift + V to toggle', style: TextStyle(color: Colors.white70)),
-        ],
-      ),
-    );
-  }
+  State<_OverlayContent> createState() => _OverlayContentState();
 }
 
-class _OverlayContent extends StatelessWidget {
-  const _OverlayContent();
+class _OverlayContentState extends State<_OverlayContent> with SingleTickerProviderStateMixin {
+  final TextEditingController _searchController = TextEditingController();
+  final FocusNode _searchFocusNode = FocusNode();
+  late TabController _tabController;
+  List<Map<String, dynamic>> _clipboardItems = [];
+  String _selectedCategory = 'history';
+
+  final List<Map<String, String>> _categories = [
+    {'id': 'history', 'name': 'Clipboard History', 'icon': '📋'},
+    {'id': 'links', 'name': 'Useful Links', 'icon': '🔗'},
+    {'id': 'notes', 'name': 'Important Notes', 'icon': '📝'},
+    {'id': 'code', 'name': 'Code Snippets', 'icon': '💻'},
+  ];
+
+  @override
+  void initState() {
+    super.initState();
+    _tabController = TabController(length: _categories.length, vsync: this);
+    _tabController.addListener(_onTabChanged);
+    _loadClipboardItems();
+
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _searchFocusNode.requestFocus();
+    });
+  }
+
+  void _onTabChanged() {
+    if (_tabController.indexIsChanging) {
+      setState(() {
+        _selectedCategory = _categories[_tabController.index]['id']!;
+      });
+      _loadClipboardItems();
+    }
+  }
+
+  Future<void> _loadClipboardItems() async {
+    final items = await ClipboardDatabase.instance.getItems(
+      category: _selectedCategory == 'history' ? null : _selectedCategory,
+    );
+    setState(() {
+      _clipboardItems = items;
+    });
+  }
+
+  @override
+  void dispose() {
+    _tabController.dispose();
+    _searchController.dispose();
+    _searchFocusNode.dispose();
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
-      mainAxisAlignment: MainAxisAlignment.center,
       children: [
+        // Header with tabs
         Row(
-          children: const [
-            Text('📋 PastePro', style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold)),
-            Spacer(),
-            Icon(Icons.push_pin_outlined, color: Colors.white54, size: 20),
+          children: [
+            Container(
+              padding: const EdgeInsets.all(10),
+              decoration: BoxDecoration(
+                gradient: LinearGradient(
+                  colors: [
+                    const Color(0xFF64FFDA).withOpacity(0.15),
+                    const Color(0xFF00BFA5).withOpacity(0.15),
+                  ],
+                ),
+                borderRadius: BorderRadius.circular(12),
+              ),
+              child: const Icon(Icons.content_paste_rounded, size: 24, color: Color(0xFF64FFDA)),
+            ),
+            const SizedBox(width: 16),
+            const Text(
+              'PastePro',
+              style: TextStyle(
+                fontSize: 26,
+                fontWeight: FontWeight.w700,
+                color: Colors.white,
+                letterSpacing: -0.5,
+              ),
+            ),
+            const Spacer(),
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+              decoration: BoxDecoration(
+                color: Colors.white.withOpacity(0.06),
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(color: Colors.white.withOpacity(0.08)),
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(Icons.keyboard, size: 14, color: Colors.white.withOpacity(0.6)),
+                  const SizedBox(width: 6),
+                  Text(
+                    'Ctrl+Shift+\\',
+                    style: TextStyle(
+                      color: Colors.white.withOpacity(0.7),
+                      fontSize: 12,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                ],
+              ),
+            ),
           ],
         ),
-        const SizedBox(height: 12),
-        Text(
-          'Overlay ready. Keep typing anywhere – tap Ctrl+Shift+V to pull me up again.',
-          style: TextStyle(color: Colors.white.withOpacity(0.72)),
-        ),
-        const SizedBox(height: 32),
+        const SizedBox(height: 20),
+
+        // Category tabs
         Container(
-          padding: const EdgeInsets.all(16),
+          height: 44,
           decoration: BoxDecoration(
             color: Colors.white.withOpacity(0.04),
-            borderRadius: BorderRadius.circular(14),
+            borderRadius: BorderRadius.circular(12),
             border: Border.all(color: Colors.white.withOpacity(0.08)),
           ),
-          child: const TextField(
-            autofocus: true,
-            decoration: InputDecoration(
-              hintText: 'Search recent clips…',
-              border: InputBorder.none,
+          child: TabBar(
+            controller: _tabController,
+            indicator: BoxDecoration(
+              color: const Color(0xFF64FFDA).withOpacity(0.15),
+              borderRadius: BorderRadius.circular(10),
             ),
-            style: TextStyle(color: Colors.white),
+            labelColor: const Color(0xFF64FFDA),
+            unselectedLabelColor: Colors.white.withOpacity(0.5),
+            dividerColor: Colors.transparent,
+            tabs: _categories.map((cat) {
+              return Tab(
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Text(cat['icon']!, style: const TextStyle(fontSize: 14)),
+                    const SizedBox(width: 8),
+                    Text(
+                      cat['name']!,
+                      style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600),
+                    ),
+                  ],
+                ),
+              );
+            }).toList(),
           ),
+        ),
+        const SizedBox(height: 20),
+
+        // Search bar
+        Container(
+          decoration: BoxDecoration(
+            color: Colors.white.withOpacity(0.04),
+            borderRadius: BorderRadius.circular(16),
+            border: Border.all(color: Colors.white.withOpacity(0.08)),
+          ),
+          child: TextField(
+            controller: _searchController,
+            focusNode: _searchFocusNode,
+            style: const TextStyle(color: Colors.white, fontSize: 15),
+            decoration: InputDecoration(
+              hintText: 'Search clipboard history...',
+              hintStyle: TextStyle(color: Colors.white.withOpacity(0.4), fontSize: 15),
+              prefixIcon: Icon(Icons.search, color: Colors.white.withOpacity(0.4), size: 22),
+              border: InputBorder.none,
+              contentPadding: const EdgeInsets.symmetric(horizontal: 20, vertical: 16),
+            ),
+          ),
+        ),
+        const SizedBox(height: 20),
+
+        // Clipboard items
+        Expanded(
+          child: _clipboardItems.isEmpty
+              ? Center(
+                  child: Text(
+                    'No items yet',
+                    style: TextStyle(color: Colors.white.withOpacity(0.4)),
+                  ),
+                )
+              : ListView.builder(
+                  itemCount: _clipboardItems.length,
+                  itemBuilder: (context, index) {
+                    final item = _clipboardItems[index];
+                    return _ClipboardItemCard(
+                      item: item,
+                      onTap: () => _pasteItem(item),
+                    );
+                  },
+                ),
         ),
       ],
     );
+  }
+
+  void _pasteItem(Map<String, dynamic> item) {
+    debugPrint('Pasting: ${item['content']}');
+    // TODO: Implement paste functionality
+  }
+}
+
+class _ClipboardItemCard extends StatefulWidget {
+  final Map<String, dynamic> item;
+  final VoidCallback onTap;
+
+  const _ClipboardItemCard({
+    required this.item,
+    required this.onTap,
+  });
+
+  @override
+  State<_ClipboardItemCard> createState() => _ClipboardItemCardState();
+}
+
+class _ClipboardItemCardState extends State<_ClipboardItemCard> {
+  bool _isHovered = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final String content = widget.item['content'] as String;
+    final String type = widget.item['type'] as String;
+    final int timestamp = widget.item['created_at'] as int;
+
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 12),
+      child: MouseRegion(
+        onEnter: (_) => setState(() => _isHovered = true),
+        onExit: (_) => setState(() => _isHovered = false),
+        child: GestureDetector(
+          onTap: widget.onTap,
+          child: AnimatedContainer(
+            duration: const Duration(milliseconds: 150),
+            padding: const EdgeInsets.all(16),
+            decoration: BoxDecoration(
+              color: _isHovered
+                  ? Colors.white.withOpacity(0.08)
+                  : Colors.white.withOpacity(0.04),
+              borderRadius: BorderRadius.circular(14),
+              border: Border.all(
+                color: _isHovered
+                    ? Colors.white.withOpacity(0.12)
+                    : Colors.white.withOpacity(0.06),
+              ),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    Icon(
+                      _getIconForType(type),
+                      size: 16,
+                      color: _getColorForType(type),
+                    ),
+                    const SizedBox(width: 8),
+                    Text(
+                      widget.item['source_app'] ?? 'Unknown',
+                      style: TextStyle(
+                        color: Colors.white.withOpacity(0.5),
+                        fontSize: 12,
+                        fontWeight: FontWeight.w500,
+                      ),
+                    ),
+                    const Spacer(),
+                    Text(
+                      _formatTimestamp(DateTime.fromMillisecondsSinceEpoch(timestamp)),
+                      style: TextStyle(
+                        color: Colors.white.withOpacity(0.4),
+                        fontSize: 11,
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 10),
+                Text(
+                  content,
+                  maxLines: 3,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontSize: 14,
+                    height: 1.5,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  IconData _getIconForType(String type) {
+    switch (type) {
+      case 'text':
+        return Icons.text_fields;
+      case 'image':
+        return Icons.image;
+      case 'file':
+        return Icons.insert_drive_file;
+      default:
+        return Icons.content_paste;
+    }
+  }
+
+  Color _getColorForType(String type) {
+    switch (type) {
+      case 'text':
+        return const Color(0xFF64FFDA);
+      case 'image':
+        return const Color(0xFFFF7597);
+      case 'file':
+        return const Color(0xFF82AAFF);
+      default:
+        return Colors.white;
+    }
+  }
+
+  String _formatTimestamp(DateTime timestamp) {
+    final now = DateTime.now();
+    final difference = now.difference(timestamp);
+
+    if (difference.inMinutes < 1) {
+      return 'Just now';
+    } else if (difference.inMinutes < 60) {
+      return '${difference.inMinutes}m ago';
+    } else if (difference.inHours < 24) {
+      return '${difference.inHours}h ago';
+    } else {
+      return '${difference.inDays}d ago';
+    }
   }
 }
 
