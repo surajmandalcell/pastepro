@@ -66,6 +66,7 @@ class _PasteProAppState extends State<PasteProApp>
   late final Animation<double> _slideAnimation;
   late final Animation<double> _fadeAnimation;
   late final VoidCallback _trayActivateHandler = () => unawaited(_toggleOverlay());
+  final FocusNode _rootFocus = FocusNode();
 
   @override
   void initState() {
@@ -168,6 +169,9 @@ class _PasteProAppState extends State<PasteProApp>
       } else {
         await WindowService.instance.show();
         await _animationController.forward();
+        if (_rootFocus.canRequestFocus) {
+          _rootFocus.requestFocus();
+        }
       }
     } catch (e) {
       debugPrint('Toggle error: $e');
@@ -176,21 +180,9 @@ class _PasteProAppState extends State<PasteProApp>
 
   @override
   void onWindowBlur() {
-    // Only hide if pointer is outside our bounds (likely clicked another window)
-    unawaited(() async {
-      try {
-        final rect = await windowManager.getBounds();
-        final p = await screenRetriever.getCursorScreenPoint();
-        final inside = p.dx >= rect.left && p.dx <= rect.left + rect.width &&
-            p.dy >= rect.top && p.dy <= rect.top + rect.height;
-        if (!inside) {
-          await _animationController.reverse();
-          await WindowService.instance.hide();
-        }
-      } catch (e) {
-        LoggingService.instance.warn('onWindowBlur check failed: $e');
-      }
-    }());
+    // On Wayland compositors like Hyprland, blur detection can be finicky.
+    // Fallback: hide on blur unconditionally to ensure click-outside hides.
+    unawaited(_animationController.reverse().then((_) => WindowService.instance.hide()));
   }
 
   @override
@@ -213,59 +205,25 @@ class _PasteProAppState extends State<PasteProApp>
         backgroundColor: Colors.transparent,
         body: AnimatedBuilder(
           animation: _animationController,
-          builder: (context, child) {
+          builder: (context, _) {
             return Align(
               alignment: Alignment.bottomCenter,
               child: Transform.translate(
                 offset: Offset(0, (1 - _slideAnimation.value) * 50),
                 child: Opacity(
                   opacity: _fadeAnimation.value,
-                  child: child,
+                  child: _OverlayShell(
+                    focusNode: _rootFocus,
+                    overlayHeight: overlayHeight,
+                    onDismiss: () async {
+                      await _animationController.reverse();
+                      await WindowService.instance.hide();
+                    },
+                  ),
                 ),
               ),
             );
           },
-          child: RawKeyboardListener(
-            autofocus: true,
-            focusNode: FocusNode(),
-            onKey: (e) async {
-              if (e.isKeyPressed(LogicalKeyboardKey.escape)) {
-                await _animationController.reverse();
-                await WindowService.instance.hide();
-              }
-            },
-            child: Container(
-              width: double.infinity,
-              height: overlayHeight,
-              decoration: BoxDecoration(
-                borderRadius: const BorderRadius.vertical(top: Radius.circular(24)),
-                border: Border.all(color: Colors.white.withOpacity(0.08), width: 1),
-                boxShadow: [
-                  BoxShadow(
-                    color: Colors.black.withOpacity(0.45),
-                    blurRadius: 40,
-                    offset: const Offset(0, -10),
-                  ),
-                ],
-              ),
-              clipBehavior: Clip.antiAlias,
-              child: Stack(
-                fit: StackFit.expand,
-                children: [
-                  Container(color: Colors.black.withOpacity(0.2)),
-                  BackdropFilter(
-                    filter: ImageFilter.blur(sigmaX: 30, sigmaY: 30),
-                    child: const SizedBox.expand(),
-                  ),
-                  Container(color: const Color(0xFFEEDFC8).withOpacity(0.82)),
-                  Padding(
-                    padding: const EdgeInsets.fromLTRB(32, 24, 32, 24),
-                    child: const _OverlayContent(),
-                  ),
-                ],
-              ),
-            ),
-          ),
         ),
       ),
     );
@@ -277,6 +235,65 @@ class _OverlayContent extends StatefulWidget {
 
   @override
   State<_OverlayContent> createState() => _OverlayContentState();
+}
+
+class _OverlayShell extends StatelessWidget {
+  final FocusNode focusNode;
+  final double overlayHeight;
+  final Future<void> Function() onDismiss;
+  const _OverlayShell({required this.focusNode, required this.overlayHeight, required this.onDismiss});
+
+  @override
+  Widget build(BuildContext context) {
+    return Shortcuts(
+      shortcuts: <ShortcutActivator, Intent>{
+        const SingleActivator(LogicalKeyboardKey.escape): const DismissIntent(),
+      },
+      child: Actions(
+        actions: <Type, Action<Intent>>{
+          DismissIntent: CallbackAction<DismissIntent>(onInvoke: (intent) {
+            onDismiss();
+            return null;
+          }),
+        },
+        child: Focus(
+          autofocus: true,
+          focusNode: focusNode,
+          child: Container(
+            width: double.infinity,
+            height: overlayHeight,
+            decoration: BoxDecoration(
+              borderRadius: const BorderRadius.vertical(top: Radius.circular(24)),
+              border: Border.all(color: Colors.white.withOpacity(0.08), width: 1),
+              boxShadow: [
+                BoxShadow(
+                  color: Colors.black.withOpacity(0.45),
+                  blurRadius: 40,
+                  offset: const Offset(0, -10),
+                ),
+              ],
+            ),
+            clipBehavior: Clip.antiAlias,
+            child: Stack(
+              fit: StackFit.expand,
+              children: [
+                Container(color: Colors.black.withOpacity(0.2)),
+                BackdropFilter(
+                  filter: ImageFilter.blur(sigmaX: 30, sigmaY: 30),
+                  child: const SizedBox.expand(),
+                ),
+                Container(color: const Color(0xFFEEDFC8).withOpacity(0.82)),
+                const Padding(
+                  padding: EdgeInsets.fromLTRB(32, 24, 32, 24),
+                  child: _OverlayContent(),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
 }
 
 class _OverlayContentState extends State<_OverlayContent> with SingleTickerProviderStateMixin {
@@ -310,7 +327,7 @@ class _OverlayContentState extends State<_OverlayContent> with SingleTickerProvi
   Future<void> _loadClipboardItems() async {
     try {
       final items = await ClipboardService.instance.getItems(
-        category: _selectedCategory == 'history' ? null : _selectedCategory,
+        category: _selectedCategory == 'Clipboard History' ? null : _selectedCategory,
       );
       if (mounted) {
         setState(() {
