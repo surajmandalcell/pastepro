@@ -6,11 +6,16 @@ import 'package:flutter/services.dart';
 import 'package:flutter/foundation.dart';
 import 'package:hotkey_manager/hotkey_manager.dart';
 import 'package:window_manager/window_manager.dart';
+import 'package:screen_retriever/screen_retriever.dart';
+import 'dart:ui';
 
 import 'models/clipboard_item.dart';
+import 'models/category.dart' as m;
+import 'database.dart';
 import 'services/clipboard_service.dart';
 import 'services/single_instance_manager.dart';
 import 'services/window_service.dart';
+import 'services/logging_service.dart';
 import 'settings_panel.dart';
 
 const double _overlayHeightRatio = 0.60;
@@ -21,9 +26,14 @@ final HotKey _toggleHotKey = HotKey(
 );
 
 Future<void> main() async {
-  // Wrap everything in error handling
+  // Wrap everything in error handling and capture prints to app.log
   runZonedGuarded(() async {
     WidgetsFlutterBinding.ensureInitialized();
+    await LoggingService.instance.initialize();
+    FlutterError.onError = (details) {
+      LoggingService.instance.error(details.exception, details.stack);
+      FlutterError.presentError(details);
+    };
 
     // Single instance check
     if (!await SingleInstanceManager.instance.ensureSingleInstance()) {
@@ -38,10 +48,9 @@ Future<void> main() async {
 
     runApp(const PasteProApp());
   }, (error, stack) {
-    // In debug/dev runs, avoid exiting the process to keep `flutter run` alive.
-    // In release, still avoid abrupt termination; log and let Flutter error UI show.
-    debugPrint('Fatal error: $error\n$stack');
-  });
+    LoggingService.instance.error(error, stack);
+  },
+      zoneSpecification: LoggingService.instance.zoneSpec);
 }
 
 class PasteProApp extends StatefulWidget {
@@ -167,9 +176,21 @@ class _PasteProAppState extends State<PasteProApp>
 
   @override
   void onWindowBlur() {
-    unawaited(_animationController.reverse().then((_) async {
-      await WindowService.instance.hide();
-    }));
+    // Only hide if pointer is outside our bounds (likely clicked another window)
+    unawaited(() async {
+      try {
+        final rect = await windowManager.getBounds();
+        final p = await screenRetriever.getCursorScreenPoint();
+        final inside = p.dx >= rect.left && p.dx <= rect.left + rect.width &&
+            p.dy >= rect.top && p.dy <= rect.top + rect.height;
+        if (!inside) {
+          await _animationController.reverse();
+          await WindowService.instance.hide();
+        }
+      } catch (e) {
+        LoggingService.instance.warn('onWindowBlur check failed: $e');
+      }
+    }());
   }
 
   @override
@@ -204,31 +225,46 @@ class _PasteProAppState extends State<PasteProApp>
               ),
             );
           },
-          child: Container(
-            width: double.infinity,
-            height: overlayHeight,
-            decoration: BoxDecoration(
-              gradient: LinearGradient(
-                begin: Alignment.topCenter,
-                end: Alignment.bottomCenter,
-                colors: [
-                  const Color(0xFF1A1F2E).withOpacity(0.98),
-                  const Color(0xFF0F1419).withOpacity(0.98),
+          child: RawKeyboardListener(
+            autofocus: true,
+            focusNode: FocusNode(),
+            onKey: (e) async {
+              if (e.isKeyPressed(LogicalKeyboardKey.escape)) {
+                await _animationController.reverse();
+                await WindowService.instance.hide();
+              }
+            },
+            child: Container(
+              width: double.infinity,
+              height: overlayHeight,
+              decoration: BoxDecoration(
+                borderRadius: const BorderRadius.vertical(top: Radius.circular(24)),
+                border: Border.all(color: Colors.white.withOpacity(0.08), width: 1),
+                boxShadow: [
+                  BoxShadow(
+                    color: Colors.black.withOpacity(0.45),
+                    blurRadius: 40,
+                    offset: const Offset(0, -10),
+                  ),
                 ],
               ),
-              borderRadius: const BorderRadius.vertical(top: Radius.circular(24)),
-              border: Border.all(color: Colors.white.withOpacity(0.08), width: 1),
-              boxShadow: [
-                BoxShadow(
-                  color: Colors.black.withOpacity(0.5),
-                  blurRadius: 40,
-                  spreadRadius: 0,
-                  offset: const Offset(0, -10),
-                ),
-              ],
+              clipBehavior: Clip.antiAlias,
+              child: Stack(
+                fit: StackFit.expand,
+                children: [
+                  Container(color: Colors.black.withOpacity(0.2)),
+                  BackdropFilter(
+                    filter: ImageFilter.blur(sigmaX: 30, sigmaY: 30),
+                    child: const SizedBox.expand(),
+                  ),
+                  Container(color: const Color(0xFFEEDFC8).withOpacity(0.82)),
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(32, 24, 32, 24),
+                    child: const _OverlayContent(),
+                  ),
+                ],
+              ),
             ),
-            padding: const EdgeInsets.fromLTRB(32, 28, 32, 24),
-            child: const _OverlayContent(),
           ),
         ),
       ),
@@ -249,21 +285,13 @@ class _OverlayContentState extends State<_OverlayContent> with SingleTickerProvi
   late TabController _tabController;
   List<ClipboardItem> _clipboardItems = [];
   String _searchQuery = '';
-  String _selectedCategory = 'history';
-
-  final List<Map<String, String>> _categories = [
-    {'id': 'history', 'name': 'History', 'icon': '📋'},
-    {'id': 'links', 'name': 'Links', 'icon': '🔗'},
-    {'id': 'notes', 'name': 'Notes', 'icon': '📝'},
-    {'id': 'code', 'name': 'Code', 'icon': '💻'},
-  ];
+  String _selectedCategory = 'Clipboard History';
+  List<m.Category> _categories = [];
 
   @override
   void initState() {
     super.initState();
-    _tabController = TabController(length: _categories.length, vsync: this);
-    _tabController.addListener(_onTabChanged);
-    _loadClipboardItems();
+    _loadCategories().then((_) => _loadClipboardItems());
 
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _searchFocusNode.requestFocus();
@@ -273,7 +301,7 @@ class _OverlayContentState extends State<_OverlayContent> with SingleTickerProvi
   void _onTabChanged() {
     if (_tabController.indexIsChanging) {
       setState(() {
-        _selectedCategory = _categories[_tabController.index]['id']!;
+        _selectedCategory = _categories[_tabController.index].name;
       });
       _loadClipboardItems();
     }
@@ -380,39 +408,24 @@ class _OverlayContentState extends State<_OverlayContent> with SingleTickerProvi
           ],
         ),
         const SizedBox(height: 20),
-        Container(
-          height: 44,
-          decoration: BoxDecoration(
-            color: Colors.white.withOpacity(0.04),
-            borderRadius: BorderRadius.circular(12),
-            border: Border.all(color: Colors.white.withOpacity(0.08)),
-          ),
-          child: TabBar(
-            controller: _tabController,
-            isScrollable: true,
-            indicator: BoxDecoration(
-              color: const Color(0xFF64FFDA).withOpacity(0.15),
-              borderRadius: BorderRadius.circular(10),
-            ),
-            labelColor: const Color(0xFF64FFDA),
-            unselectedLabelColor: Colors.white.withOpacity(0.5),
-            dividerColor: Colors.transparent,
-            tabs: _categories.map((cat) {
-              return Tab(
-                child: Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Text(cat['icon']!, style: const TextStyle(fontSize: 14)),
-                    const SizedBox(width: 8),
-                    Text(
-                      cat['name']!,
-                      style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600),
-                    ),
-                  ],
-                ),
-              );
-            }).toList(),
-          ),
+        _CategoryChips(
+          categories: _categories,
+          selected: _selectedCategory,
+          onAdd: _addCategory,
+          onDelete: _deleteCategory,
+          onSelect: (name) {
+            setState(() => _selectedCategory = name);
+            _loadClipboardItems();
+          },
+          onAcceptDrop: (name, item) async {
+            if (item.id != null) {
+              await ClipboardService.instance.setItemCategory(item.id!, name);
+              await _loadClipboardItems();
+            }
+          },
+          onAddFromClipboard: (name) async {
+            await _addClipboardToCategory(name);
+          },
         ),
         const SizedBox(height: 20),
         Container(
@@ -459,10 +472,24 @@ class _OverlayContentState extends State<_OverlayContent> with SingleTickerProvi
                   ),
                 )
               : ListView.builder(
+                  scrollDirection: Axis.horizontal,
                   itemCount: _filteredItems.length,
                   itemBuilder: (context, index) {
                     final item = _filteredItems[index];
-                    return _ClipboardItemCard(item: item);
+                    return Padding(
+                      padding: const EdgeInsets.only(right: 16),
+                      child: Draggable<ClipboardItem>(
+                        data: item,
+                        feedback: Material(
+                          color: Colors.transparent,
+                          child: Opacity(
+                            opacity: 0.85,
+                            child: SizedBox(width: 360, child: _ClipboardItemCard(item: item)),
+                          ),
+                        ),
+                        child: SizedBox(width: 360, child: _ClipboardItemCard(item: item)),
+                      ),
+                    );
                   },
                 ),
         ),
@@ -475,6 +502,153 @@ class _OverlayContentState extends State<_OverlayContent> with SingleTickerProvi
     return _clipboardItems
         .where((e) => e.content.toLowerCase().contains(_searchQuery))
         .toList();
+  }
+
+  Future<void> _addClipboardToCategory(String name) async {
+    try {
+      final data = await Clipboard.getData(Clipboard.kTextPlain);
+      if (data?.text == null || data!.text!.trim().isEmpty) return;
+      final item = ClipboardItem(
+        content: data.text!.trim(),
+        type: 'text',
+        category: name,
+        sourceApp: 'Unknown',
+        createdAt: DateTime.now(),
+      );
+      await ClipboardDatabase.instance.insertItem(item.toMap());
+      await _loadClipboardItems();
+    } catch (e) {
+      LoggingService.instance.warn('Add from clipboard failed: $e');
+    }
+  }
+
+  Future<void> _loadCategories() async {
+    try {
+      final rows = await ClipboardDatabase.instance.getCategories();
+      final cats = rows.map((map) => m.Category.fromMap(map)).toList();
+      setState(() {
+        _categories = cats;
+        if (cats.isNotEmpty) _selectedCategory = cats.first.name;
+        _tabController = TabController(length: _categories.length, vsync: this);
+        _tabController.addListener(_onTabChanged);
+      });
+    } catch (e) {
+      LoggingService.instance.warn('loadCategories failed: $e');
+    }
+  }
+
+  Future<void> _addCategory() async {
+    final nameController = TextEditingController();
+    final colorOptions = [0xFFD7C6A5, 0xFFF16B5F, 0xFFF4C34A, 0xFF69D494, 0xFF5AA7F8, 0xFFB48EDE];
+    int picked = colorOptions.first;
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (c) => AlertDialog(
+        title: const Text('New Category'),
+        content: StatefulBuilder(builder: (context, setStateSB) {
+          return Column(mainAxisSize: MainAxisSize.min, children: [
+            TextField(controller: nameController, decoration: const InputDecoration(hintText: 'Name')),
+            const SizedBox(height: 12),
+            Wrap(spacing: 8, children: [
+              for (final col in colorOptions)
+                InkWell(
+                  onTap: () => setStateSB(() => picked = col),
+                  child: Container(width: 24, height: 24, decoration: BoxDecoration(color: Color(col), shape: BoxShape.circle, border: Border.all(color: picked == col ? Colors.black : Colors.black26, width: picked == col ? 2 : 1))),
+                ),
+            ]),
+          ]);
+        }),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(c, false), child: const Text('Cancel')),
+          ElevatedButton(onPressed: () => Navigator.pop(c, true), child: const Text('Add')),
+        ],
+      ),
+    );
+    if (ok == true) {
+      await ClipboardDatabase.instance.insertCategory(nameController.text.trim(), picked);
+      await _loadCategories();
+    }
+  }
+
+  Future<void> _deleteCategory(m.Category cat) async {
+    await ClipboardDatabase.instance.deleteCategory(cat.id);
+    await _loadCategories();
+  }
+}
+
+class _CategoryChips extends StatelessWidget {
+  final List<m.Category> categories;
+  final String selected;
+  final VoidCallback onAdd;
+  final void Function(m.Category) onDelete;
+  final ValueChanged<String> onSelect;
+  final Future<void> Function(String, ClipboardItem) onAcceptDrop;
+  final Future<void> Function(String) onAddFromClipboard;
+
+  const _CategoryChips({
+    required this.categories,
+    required this.selected,
+    required this.onAdd,
+    required this.onDelete,
+    required this.onSelect,
+    required this.onAcceptDrop,
+    required this.onAddFromClipboard,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      height: 46,
+      decoration: BoxDecoration(
+        color: Colors.black.withOpacity(0.06),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: Colors.white.withOpacity(0.08)),
+      ),
+      padding: const EdgeInsets.symmetric(horizontal: 8),
+      child: ListView(
+        scrollDirection: Axis.horizontal,
+        children: [
+          const SizedBox(width: 6),
+          for (final cat in categories)
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 6),
+              child: DragTarget<ClipboardItem>(
+                onAccept: (item) => onAcceptDrop(cat.name, item),
+                builder: (context, candidate, rejected) {
+                  final selectedColor = Color(cat.color).withOpacity(0.7);
+                  final back = Color(cat.color).withOpacity(0.35);
+                  return GestureDetector(
+                    onSecondaryTapDown: (d) async {
+                      final res = await showMenu<String>(
+                        context: context,
+                        position: RelativeRect.fromLTRB(d.globalPosition.dx, d.globalPosition.dy, 0, 0),
+                        items: const [
+                          PopupMenuItem(value: 'add', child: Text('Add From Clipboard')),
+                          PopupMenuItem(value: 'delete', child: Text('Delete Category')),
+                        ],
+                      );
+                      if (res == 'delete') onDelete(cat);
+                      if (res == 'add') await onAddFromClipboard(cat.name);
+                    },
+                    child: ChoiceChip(
+                      selected: selected == cat.name,
+                      onSelected: (_) => onSelect(cat.name),
+                      label: Text(cat.name, style: const TextStyle(fontWeight: FontWeight.w600)),
+                      backgroundColor: back,
+                      selectedColor: selectedColor,
+                    ),
+                  );
+                },
+              ),
+            ),
+          IconButton(
+            icon: const Icon(Icons.add),
+            tooltip: 'Add Category',
+            onPressed: onAdd,
+          ),
+        ],
+      ),
+    );
   }
 }
 

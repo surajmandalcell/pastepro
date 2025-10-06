@@ -81,6 +81,14 @@ class ClipboardService {
     }
   }
 
+  Future<void> setItemCategory(int id, String? category) async {
+    try {
+      await ClipboardDatabase.instance.setItemCategory(id, category);
+    } catch (e) {
+      print('Failed to set item category: $e');
+    }
+  }
+
   Future<void> deleteItem(int id) async {
     try {
       await ClipboardDatabase.instance.deleteItem(id);
