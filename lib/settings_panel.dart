@@ -1,7 +1,11 @@
 import 'package:flutter/material.dart';
+// ignore_for_file: deprecated_member_use
+// theme tokens provided via app_theme.dart (colors are applied through ThemeData)
 
 class SettingsPanel extends StatefulWidget {
-  const SettingsPanel({super.key});
+  final ThemeMode themeMode;
+  final ValueChanged<ThemeMode> onThemeModeChanged;
+  const SettingsPanel({super.key, required this.themeMode, required this.onThemeModeChanged});
 
   @override
   State<SettingsPanel> createState() => _SettingsPanelState();
@@ -18,31 +22,34 @@ class _SettingsPanelState extends State<SettingsPanel> {
 
   @override
   Widget build(BuildContext context) {
+    final brightness = Theme.of(context).brightness;
+    final isDark = brightness == Brightness.dark;
     return Dialog(
       elevation: 0,
       backgroundColor: Colors.transparent,
-      insetPadding: const EdgeInsets.all(40),
+      insetPadding: const EdgeInsets.symmetric(horizontal: 24, vertical: 24),
       child: Container(
         decoration: BoxDecoration(
-          color: const Color(0xFFF7F7F9),
-          borderRadius: BorderRadius.circular(16),
+          color: isDark ? const Color(0xFF1E1E1F) : const Color(0xFFF4F4F7),
+          borderRadius: BorderRadius.circular(12),
           boxShadow: [
             BoxShadow(
-              color: Colors.black.withOpacity(0.25),
+              color: Colors.black.withOpacity(0.35),
               blurRadius: 32,
               offset: const Offset(0, 12),
             ),
           ],
         ),
         clipBehavior: Clip.antiAlias,
-        height: 540,
+        width: 720,
+        height: 520,
         child: Row(
           children: [
             _Sidebar(
               selected: 0,
               onSelected: (_) {},
             ),
-            const VerticalDivider(width: 1, thickness: 1, color: Color(0x11000000)),
+            VerticalDivider(width: 1, thickness: 1, color: (isDark ? Colors.white : Colors.black).withOpacity(0.06)),
             Expanded(
               child: _GeneralSettings(
                 openAtLogin: openAtLogin,
@@ -59,6 +66,8 @@ class _SettingsPanelState extends State<SettingsPanel> {
                   pasteTarget = s.pasteTarget;
                   historySpan = s.historySpan;
                 }),
+                themeMode: widget.themeMode,
+                onThemeModeChanged: widget.onThemeModeChanged,
               ),
             ),
           ],
@@ -125,6 +134,8 @@ class _GeneralSettings extends StatelessWidget {
   final String pasteTarget; // 'active' | 'clipboard'
   final double historySpan; // 0..4
   final ValueChanged<_SettingsState> onChanged;
+  final ThemeMode themeMode;
+  final ValueChanged<ThemeMode> onThemeModeChanged;
 
   const _GeneralSettings({
     required this.openAtLogin,
@@ -134,6 +145,8 @@ class _GeneralSettings extends StatelessWidget {
     required this.pasteTarget,
     required this.historySpan,
     required this.onChanged,
+    required this.themeMode,
+    required this.onThemeModeChanged,
   });
 
   @override
@@ -143,6 +156,19 @@ class _GeneralSettings extends StatelessWidget {
       child: ListView(
         children: [
           const Text('General', style: TextStyle(fontSize: 18, fontWeight: FontWeight.w700)),
+          const SizedBox(height: 12),
+          _row(
+            'Appearance',
+            SegmentedButton<ThemeMode>(
+              segments: const [
+                ButtonSegment(value: ThemeMode.system, label: Text('Auto')),
+                ButtonSegment(value: ThemeMode.light, label: Text('Light')),
+                ButtonSegment(value: ThemeMode.dark, label: Text('Dark')),
+              ],
+              selected: {themeMode},
+              onSelectionChanged: (s) => onThemeModeChanged(s.first),
+            ),
+          ),
           const SizedBox(height: 16),
           _row(
             'Open at login',
@@ -246,4 +272,3 @@ class _SettingsState {
     required this.historySpan,
   });
 }
-

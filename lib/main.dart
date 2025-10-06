@@ -6,7 +6,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter/foundation.dart';
 import 'package:hotkey_manager/hotkey_manager.dart';
 import 'package:window_manager/window_manager.dart';
-import 'package:screen_retriever/screen_retriever.dart';
+// screen_retriever is used within WindowService; not needed here
 import 'dart:ui';
 
 import 'models/clipboard_item.dart';
@@ -16,6 +16,7 @@ import 'services/clipboard_service.dart';
 import 'services/single_instance_manager.dart';
 import 'services/window_service.dart';
 import 'services/logging_service.dart';
+import 'ui/app_theme.dart';
 import 'settings_panel.dart';
 
 const double _overlayHeightRatio = 0.60;
@@ -67,6 +68,7 @@ class _PasteProAppState extends State<PasteProApp>
   late final Animation<double> _fadeAnimation;
   late final VoidCallback _trayActivateHandler = () => unawaited(_toggleOverlay());
   final FocusNode _rootFocus = FocusNode();
+  final ValueNotifier<ThemeMode> _themeMode = ValueNotifier(ThemeMode.system);
 
   @override
   void initState() {
@@ -189,9 +191,12 @@ class _PasteProAppState extends State<PasteProApp>
   Widget build(BuildContext context) {
     final overlayHeight = WindowService.instance.overlayHeight ?? 480;
 
-    return MaterialApp(
+    return ValueListenableBuilder<ThemeMode>(
+      valueListenable: _themeMode,
+      builder: (_, mode, __) => MaterialApp(
       debugShowCheckedModeBanner: false,
       title: 'PastePro',
+      themeMode: mode,
       theme: ThemeData(
         colorScheme: const ColorScheme.dark(
           primary: Color(0xFF64FFDA),
@@ -201,6 +206,7 @@ class _PasteProAppState extends State<PasteProApp>
         scaffoldBackgroundColor: Colors.transparent,
         useMaterial3: true,
       ),
+      darkTheme: ThemeData.dark(useMaterial3: true),
       home: Scaffold(
         backgroundColor: Colors.transparent,
         body: AnimatedBuilder(
@@ -209,7 +215,7 @@ class _PasteProAppState extends State<PasteProApp>
             return Align(
               alignment: Alignment.bottomCenter,
               child: Transform.translate(
-                offset: Offset(0, (1 - _slideAnimation.value) * 50),
+                offset: Offset(0, (1 - _slideAnimation.value) * 40),
                 child: Opacity(
                   opacity: _fadeAnimation.value,
                   child: _OverlayShell(
@@ -226,7 +232,7 @@ class _PasteProAppState extends State<PasteProApp>
           },
         ),
       ),
-    );
+    ));
   }
 }
 
@@ -263,13 +269,13 @@ class _OverlayShell extends StatelessWidget {
             width: double.infinity,
             height: overlayHeight,
             decoration: BoxDecoration(
-              borderRadius: const BorderRadius.vertical(top: Radius.circular(24)),
-              border: Border.all(color: Colors.white.withOpacity(0.08), width: 1),
+              borderRadius: const BorderRadius.vertical(top: Radius.circular(kOverlayRadius)),
+              border: Border.all(color: AppTheme.overlayBorder(context), width: 1),
               boxShadow: [
                 BoxShadow(
-                  color: Colors.black.withOpacity(0.45),
-                  blurRadius: 40,
-                  offset: const Offset(0, -10),
+                  color: AppTheme.overlayShadow(context).withValues(alpha: kShadowOpacity),
+                  blurRadius: kShadowBlur,
+                  offset: const Offset(0, kShadowYOffset),
                 ),
               ],
             ),
@@ -277,14 +283,14 @@ class _OverlayShell extends StatelessWidget {
             child: Stack(
               fit: StackFit.expand,
               children: [
-                Container(color: Colors.black.withOpacity(0.2)),
+                Container(color: AppTheme.overlayScrim(context)),
                 BackdropFilter(
-                  filter: ImageFilter.blur(sigmaX: 30, sigmaY: 30),
+                  filter: ImageFilter.blur(sigmaX: kBackdropBlurSigma, sigmaY: kBackdropBlurSigma),
                   child: const SizedBox.expand(),
                 ),
-                Container(color: const Color(0xFFEEDFC8).withOpacity(0.82)),
+                Container(color: AppTheme.overlayTint(context)),
                 const Padding(
-                  padding: EdgeInsets.fromLTRB(32, 24, 32, 24),
+                  padding: EdgeInsets.fromLTRB(kOverlaySidePadding, kOverlayTopPadding, kOverlaySidePadding, 20),
                   child: _OverlayContent(),
                 ),
               ],
@@ -352,139 +358,88 @@ class _OverlayContentState extends State<_OverlayContent> with SingleTickerProvi
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
+        // Top bar: [Search]  [Tags...]  [Settings]
         Row(
+          crossAxisAlignment: CrossAxisAlignment.center,
           children: [
-            Container(
-              padding: const EdgeInsets.all(10),
-              decoration: BoxDecoration(
-                gradient: LinearGradient(
-                  colors: [
-                    const Color(0xFF64FFDA).withOpacity(0.15),
-                    const Color(0xFF00BFA5).withOpacity(0.15),
-                  ],
-                ),
-                borderRadius: BorderRadius.circular(12),
-              ),
-              child: const Icon(Icons.content_paste_rounded, size: 24, color: Color(0xFF64FFDA)),
-            ),
-            const SizedBox(width: 16),
+            // Search
             Expanded(
-              child: Text(
-                'PastePro',
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-                style: const TextStyle(
-                  fontSize: 26,
-                  fontWeight: FontWeight.w700,
-                  color: Colors.white,
-                  letterSpacing: -0.5,
+              flex: 3,
+              child: Container(
+                height: 36,
+                decoration: BoxDecoration(
+                  color: AppTheme.searchBg(context),
+                  borderRadius: BorderRadius.circular(8),
+                  border: Border.all(color: AppTheme.searchBorder(context)),
+                ),
+                child: TextField(
+                  controller: _searchController,
+                  focusNode: _searchFocusNode,
+                  style: TextStyle(color: AppTheme.textPrimary(context), fontSize: 14),
+                  decoration: InputDecoration(
+                    hintText: 'Search...',
+                    border: InputBorder.none,
+                    prefixIcon: Icon(Icons.search, size: 18, color: AppTheme.textTertiary(context)),
+                    contentPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                  ),
+                  onChanged: (value) => setState(() => _searchQuery = value.trim().toLowerCase()),
                 ),
               ),
             ),
-            const SizedBox(width: 8),
+            const SizedBox(width: 12),
+            // Tags bar
+            Expanded(
+              flex: 5,
+              child: _CategoryChips(
+                categories: _categories,
+                selected: _selectedCategory,
+                onAdd: _addCategory,
+                onDelete: _deleteCategory,
+                onSelect: (name) {
+                  setState(() => _selectedCategory = name);
+                  _loadClipboardItems();
+                },
+                onAcceptDrop: (name, item) async {
+                  if (item.id != null) {
+                    await ClipboardService.instance.setItemCategory(item.id!, name);
+                    await _loadClipboardItems();
+                  }
+                },
+                onAddFromClipboard: (name) async {
+                  await _addClipboardToCategory(name);
+                },
+              ),
+            ),
+            const SizedBox(width: 12),
+            // Settings
             IconButton(
               tooltip: 'Settings',
-              icon: const Icon(Icons.settings_outlined, color: Colors.white70),
+              icon: Icon(Icons.settings_outlined, color: AppTheme.textPrimary(context)),
               onPressed: () {
                 showDialog(
                   context: context,
                   barrierColor: Colors.black54,
-                  builder: (_) => const SettingsPanel(),
+                  builder: (_) => SettingsPanel(
+                    themeMode: (context.findAncestorStateOfType<_PasteProAppState>()?._themeMode.value) ?? ThemeMode.system,
+                    onThemeModeChanged: (m) => context.findAncestorStateOfType<_PasteProAppState>()?._themeMode.value = m,
+                  ),
                 );
               },
             ),
-            Flexible(
-              child: Container(
-                constraints: const BoxConstraints(maxWidth: 180),
-                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-                decoration: BoxDecoration(
-                  color: Colors.white.withOpacity(0.06),
-                  borderRadius: BorderRadius.circular(8),
-                  border: Border.all(color: Colors.white.withOpacity(0.08)),
-                ),
-                child: Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Icon(Icons.keyboard, size: 14, color: Colors.white.withOpacity(0.6)),
-                    const SizedBox(width: 6),
-                    Flexible(
-                      child: Text(
-                        'Ctrl+Shift+\\',
-                        overflow: TextOverflow.ellipsis,
-                        style: TextStyle(
-                          color: Colors.white.withOpacity(0.7),
-                          fontSize: 12,
-                          fontWeight: FontWeight.w600,
-                        ),
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-            ),
           ],
         ),
-        const SizedBox(height: 20),
-        _CategoryChips(
-          categories: _categories,
-          selected: _selectedCategory,
-          onAdd: _addCategory,
-          onDelete: _deleteCategory,
-          onSelect: (name) {
-            setState(() => _selectedCategory = name);
-            _loadClipboardItems();
-          },
-          onAcceptDrop: (name, item) async {
-            if (item.id != null) {
-              await ClipboardService.instance.setItemCategory(item.id!, name);
-              await _loadClipboardItems();
-            }
-          },
-          onAddFromClipboard: (name) async {
-            await _addClipboardToCategory(name);
-          },
-        ),
-        const SizedBox(height: 20),
-        Container(
-          decoration: BoxDecoration(
-            color: Colors.white.withOpacity(0.04),
-            borderRadius: BorderRadius.circular(16),
-            border: Border.all(color: Colors.white.withOpacity(0.08)),
-          ),
-          child: TextField(
-            controller: _searchController,
-            focusNode: _searchFocusNode,
-            style: const TextStyle(color: Colors.white, fontSize: 15),
-            decoration: InputDecoration(
-              hintText: 'Search...',
-              hintStyle: TextStyle(color: Colors.white.withOpacity(0.4), fontSize: 15),
-              prefixIcon: Icon(Icons.search, color: Colors.white.withOpacity(0.4), size: 22),
-              border: InputBorder.none,
-              contentPadding: const EdgeInsets.symmetric(horizontal: 20, vertical: 16),
-            ),
-            onChanged: (value) {
-              setState(() => _searchQuery = value.trim().toLowerCase());
-            },
-          ),
-        ),
-        const SizedBox(height: 20),
+        const SizedBox(height: 12),
         Expanded(
           child: _filteredItems.isEmpty
               ? Center(
                   child: Column(
                     mainAxisAlignment: MainAxisAlignment.center,
                     children: [
-                      Icon(Icons.content_paste, size: 64, color: Colors.white.withOpacity(0.2)),
+                      Icon(Icons.content_paste, size: 64, color: AppTheme.textTertiary(context)),
                       const SizedBox(height: 16),
-                      Text(
-                        'No items yet',
-                        style: TextStyle(color: Colors.white.withOpacity(0.4), fontSize: 16),
-                      ),
+                      Text('No items yet', style: TextStyle(color: AppTheme.textSecondary(context), fontSize: 16)),
                       const SizedBox(height: 8),
-                      Text(
-                        'Copy something to get started',
-                        style: TextStyle(color: Colors.white.withOpacity(0.3), fontSize: 13),
-                      ),
+                      Text('Copy something to get started', style: TextStyle(color: AppTheme.textTertiary(context), fontSize: 13)),
                     ],
                   ),
                 )
@@ -630,10 +585,10 @@ class _CategoryChips extends StatelessWidget {
             Padding(
               padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 6),
               child: DragTarget<ClipboardItem>(
-                onAccept: (item) => onAcceptDrop(cat.name, item),
+                onAcceptWithDetails: (details) => onAcceptDrop(cat.name, details.data),
                 builder: (context, candidate, rejected) {
-                  final selectedColor = Color(cat.color).withOpacity(0.7);
-                  final back = Color(cat.color).withOpacity(0.35);
+                  final selectedColor = Color(cat.color).withValues(alpha: 0.7);
+                  final back = Color(cat.color).withValues(alpha: 0.35);
                   return GestureDetector(
                     onSecondaryTapDown: (d) async {
                       final res = await showMenu<String>(
@@ -692,11 +647,9 @@ class _ClipboardItemCardState extends State<_ClipboardItemCard> {
           duration: const Duration(milliseconds: 150),
           padding: const EdgeInsets.all(16),
           decoration: BoxDecoration(
-            color: _isHovered ? Colors.white.withOpacity(0.08) : Colors.white.withOpacity(0.04),
-            borderRadius: BorderRadius.circular(14),
-            border: Border.all(
-              color: _isHovered ? Colors.white.withOpacity(0.12) : Colors.white.withOpacity(0.06),
-            ),
+            color: _isHovered ? AppTheme.cardHoverBg(context) : AppTheme.cardBg(context),
+            borderRadius: BorderRadius.circular(kCardRadius),
+            border: Border.all(color: AppTheme.cardBorder(context)),
           ),
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
@@ -706,13 +659,13 @@ class _ClipboardItemCardState extends State<_ClipboardItemCard> {
                   Icon(
                     Icons.text_fields,
                     size: 16,
-                    color: const Color(0xFF64FFDA),
+                    color: kAccentTeal,
                   ),
                   const SizedBox(width: 8),
                   Text(
                     widget.item.sourceApp ?? 'Unknown',
                     style: TextStyle(
-                      color: Colors.white.withOpacity(0.5),
+                      color: AppTheme.textSecondary(context),
                       fontSize: 12,
                       fontWeight: FontWeight.w500,
                     ),
@@ -721,7 +674,7 @@ class _ClipboardItemCardState extends State<_ClipboardItemCard> {
                   Text(
                     _formatTimestamp(widget.item.createdAt),
                     style: TextStyle(
-                      color: Colors.white.withOpacity(0.4),
+                      color: AppTheme.textTertiary(context),
                       fontSize: 11,
                     ),
                   ),
@@ -732,11 +685,7 @@ class _ClipboardItemCardState extends State<_ClipboardItemCard> {
                 widget.item.content,
                 maxLines: 3,
                 overflow: TextOverflow.ellipsis,
-                style: const TextStyle(
-                  color: Colors.white,
-                  fontSize: 14,
-                  height: 1.5,
-                ),
+                style: TextStyle(color: AppTheme.textPrimary(context), fontSize: 14, height: 1.5),
               ),
             ],
           ),

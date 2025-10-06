@@ -2,6 +2,7 @@ import 'dart:io';
 import 'package:path/path.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
+import 'ui/app_theme.dart';
 
 class ClipboardDatabase {
   static final ClipboardDatabase instance = ClipboardDatabase._init();
@@ -77,14 +78,7 @@ class ClipboardDatabase {
   }
 
   Future<void> _seedDefaultCategories(Database db) async {
-    final defaults = [
-      {'name': 'Clipboard History', 'color': 0xFFD7C6A5},
-      {'name': 'Useful Links', 'color': 0xFFF16B5F},
-      {'name': 'Important Notes', 'color': 0xFFF4C34A},
-      {'name': 'Email Templates', 'color': 0xFF69D494},
-      {'name': 'Code Snippets', 'color': 0xFF5AA7F8},
-    ];
-    for (final c in defaults) {
+    for (final c in kDefaultCategories) {
       try {
         await db.insert('categories', {
           'name': c['name'],

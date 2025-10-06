@@ -9,14 +9,13 @@ class WindowService {
 
   bool _isInitialized = false;
   double? _overlayHeight;
-  double _defaultRatio = 0.38; // between 0.36 and 0.40
+  // target overlay height ratio; actual chosen via _chooseRatio
   double _minHeight = 420;
 
   Future<void> initialize({double heightRatio = 0.38, double minHeight = 420}) async {
     if (_isInitialized) return;
 
     await windowManager.ensureInitialized();
-    _defaultRatio = heightRatio;
     _minHeight = minHeight;
 
     final windowOptions = WindowOptions(
@@ -40,8 +39,20 @@ class WindowService {
 
   Future<void> show() async {
     if (!_isInitialized) throw StateError('WindowService not initialized');
+    // First attempt before showing
     await _applyActiveMonitorBounds();
     await windowManager.show();
+    // Some compositors (e.g., Hyprland/Wayland) ignore the initial move.
+    // Retry a few times after the window is visible.
+    try {
+      await windowManager.setResizable(true);
+      for (int i = 0; i < 5; i++) {
+        await _applyActiveMonitorBounds();
+        await Future.delayed(const Duration(milliseconds: 30));
+      }
+    } finally {
+      await windowManager.setResizable(false);
+    }
     await windowManager.setAlwaysOnTop(true);
     await windowManager.focus();
   }
