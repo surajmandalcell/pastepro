@@ -32,6 +32,30 @@ static void my_application_activate(GApplication* application) {
   gtk_window_set_resizable(window, FALSE);
   gtk_window_set_title(window, "📋 pastepro");
 
+  // Ensure a sensible default size so the Flutter view doesn't start as a tiny square
+  // (helps particularly under Wayland before the Dart side resizes the window).
+#if GTK_CHECK_VERSION(3,22,0)
+  GdkDisplay* display = gdk_display_get_default();
+  if (display != nullptr) {
+    GdkMonitor* monitor = gdk_display_get_primary_monitor(display);
+    if (monitor != nullptr) {
+      GdkRectangle geo;
+      gdk_monitor_get_geometry(monitor, &geo);
+      const int desired_w = geo.width;           // full width overlay
+      const int desired_h = (int)(geo.height * 0.60); // match Dart default ratio
+      gtk_window_set_default_size(window, desired_w, desired_h);
+      // Try to place near the bottom; may be ignored on Wayland.
+      gtk_window_move(window, geo.x, geo.y + geo.height - desired_h);
+    } else {
+      gtk_window_set_default_size(window, 1280, 560);
+    }
+  } else {
+    gtk_window_set_default_size(window, 1280, 560);
+  }
+#else
+  gtk_window_set_default_size(window, 1280, 560);
+#endif
+
   const gchar* icon_path = "assets/icons/clipboard.png";
   g_autoptr(GError) icon_error = nullptr;
   GdkPixbuf* icon_pixbuf = gdk_pixbuf_new_from_file(icon_path, &icon_error);

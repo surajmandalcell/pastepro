@@ -16,6 +16,7 @@ struct _PasteproTrayPlugin {
   AppIndicator* indicator;
   GtkWidget* menu;
   GtkWidget* toggle_item;
+  GtkWidget* exit_item;
 };
 
 G_DEFINE_TYPE(PasteproTrayPlugin, pastepro_tray_plugin, g_object_get_type())
@@ -33,6 +34,19 @@ static void toggle_menu_item_activate(GtkWidget* widget, gpointer user_data) {
   send_activate_signal(plugin);
 }
 
+static void send_exit_signal(PasteproTrayPlugin* self) {
+  if (self->channel == nullptr) {
+    return;
+  }
+  fl_method_channel_invoke_method(self->channel, "onExit", nullptr,
+                                  nullptr, nullptr, nullptr);
+}
+
+static void exit_menu_item_activate(GtkWidget* widget, gpointer user_data) {
+  auto* plugin = PASTEPRO_TRAY_PLUGIN(user_data);
+  send_exit_signal(plugin);
+}
+
 static void ensure_menu(PasteproTrayPlugin* self) {
   if (self->menu != nullptr) {
     return;
@@ -43,6 +57,16 @@ static void ensure_menu(PasteproTrayPlugin* self) {
                    G_CALLBACK(toggle_menu_item_activate), self);
   gtk_menu_shell_append(GTK_MENU_SHELL(self->menu), self->toggle_item);
   gtk_widget_show(self->toggle_item);
+
+  GtkWidget* sep = gtk_separator_menu_item_new();
+  gtk_menu_shell_append(GTK_MENU_SHELL(self->menu), sep);
+  gtk_widget_show(sep);
+
+  self->exit_item = gtk_menu_item_new_with_label("Quit PastePro");
+  g_signal_connect(self->exit_item, "activate",
+                   G_CALLBACK(exit_menu_item_activate), self);
+  gtk_menu_shell_append(GTK_MENU_SHELL(self->menu), self->exit_item);
+  gtk_widget_show(self->exit_item);
 }
 
 static void set_icon(PasteproTrayPlugin* self, FlValue* args) {

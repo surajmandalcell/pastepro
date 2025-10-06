@@ -27,13 +27,27 @@ class SingleInstanceManager {
       }
 
       await _lockFile!.parent.create(recursive: true);
-      await _lockFile!.writeAsString(pid.toString());
+      final maybePid = _currentPid();
+      await _lockFile!.writeAsString(maybePid?.toString() ?? 'PID:dev');
 
       return true;
     } catch (e) {
       print('SingleInstanceManager error: $e');
       return true; // Continue anyway
     }
+  }
+
+  int? _currentPid() {
+    try {
+      // Works on Linux: first token of /proc/self/stat is the pid
+      final stat = File('/proc/self/stat');
+      if (stat.existsSync()) {
+        final content = stat.readAsStringSync();
+        final pidStr = content.split(' ').first;
+        return int.tryParse(pidStr);
+      }
+    } catch (_) {}
+    return null;
   }
 
   bool _isProcessRunning(int pid) {

@@ -1,16 +1,17 @@
 import 'dart:async';
 import 'dart:io';
-import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter/foundation.dart';
 import 'package:hotkey_manager/hotkey_manager.dart';
-import 'package:path/path.dart' as path;
-import 'package:path_provider/path_provider.dart';
-import 'package:screen_retriever/screen_retriever.dart';
 import 'package:window_manager/window_manager.dart';
 
-import 'database.dart';
+import 'models/clipboard_item.dart';
+import 'services/clipboard_service.dart';
+import 'services/single_instance_manager.dart';
+import 'services/window_service.dart';
+import 'settings_panel.dart';
 
 const double _overlayHeightRatio = 0.60;
 final HotKey _toggleHotKey = HotKey(
@@ -20,88 +21,31 @@ final HotKey _toggleHotKey = HotKey(
 );
 
 Future<void> main() async {
-  WidgetsFlutterBinding.ensureInitialized();
-  await windowManager.ensureInitialized();
+  // Wrap everything in error handling
+  runZonedGuarded(() async {
+    WidgetsFlutterBinding.ensureInitialized();
 
-  // Single instance check
-  if (!await _ensureSingleInstance()) {
-    exit(0);
-  }
-
-  final display = await screenRetriever.getPrimaryDisplay();
-  final usableSize = display.visibleSize ?? display.size;
-  final origin = display.visiblePosition ?? Offset.zero;
-  final double overlayHeight = math.max(
-    480,
-    (usableSize.height * _overlayHeightRatio).roundToDouble(),
-  );
-
-  final windowOptions = WindowOptions(
-    size: Size(usableSize.width, overlayHeight),
-    minimumSize: Size(usableSize.width, overlayHeight),
-    maximumSize: Size(usableSize.width, overlayHeight),
-    skipTaskbar: true,
-    center: false,
-    backgroundColor: Colors.transparent,
-    titleBarStyle: TitleBarStyle.hidden,
-  );
-
-  windowManager.waitUntilReadyToShow(windowOptions, () async {
-    await windowManager.setResizable(false);
-    await windowManager.setSkipTaskbar(true);
-    await windowManager.setAlignment(Alignment.bottomCenter);
-
-    final double y = origin.dy + usableSize.height - overlayHeight;
-    await windowManager.setPosition(Offset(origin.dx, y));
-    await windowManager.hide();
-  });
-
-  runApp(PasteProApp(
-    overlayHeight: overlayHeight,
-  ));
-}
-
-Future<bool> _ensureSingleInstance() async {
-  try {
-    final appDir = await getApplicationDocumentsDirectory();
-    final lockFile = File(path.join(appDir.path, 'pastepro', '.lock'));
-
-    if (await lockFile.exists()) {
-      // Try to read PID from lock file
-      final pidStr = await lockFile.readAsString();
-      final pid = int.tryParse(pidStr);
-
-      if (pid != null) {
-        // Check if process is still running
-        final result = await Process.run('kill', ['-0', pid.toString()]);
-        if (result.exitCode == 0) {
-          // Process exists, kill it
-          await Process.run('kill', [pid.toString()]);
-          await Future.delayed(const Duration(milliseconds: 500));
-        }
-      }
-
-      await lockFile.delete();
+    // Single instance check
+    if (!await SingleInstanceManager.instance.ensureSingleInstance()) {
+      exit(0);
     }
 
-    // Create lock file with our PID
-    await lockFile.parent.create(recursive: true);
-    await lockFile.writeAsString(pid.toString());
+    // Initialize window service
+    await WindowService.instance.initialize(
+      heightRatio: _overlayHeightRatio,
+      minHeight: 480,
+    );
 
-    return true;
-  } catch (e) {
-    debugPrint('Single instance check failed: $e');
-    return true; // Continue anyway
-  }
+    runApp(const PasteProApp());
+  }, (error, stack) {
+    // In debug/dev runs, avoid exiting the process to keep `flutter run` alive.
+    // In release, still avoid abrupt termination; log and let Flutter error UI show.
+    debugPrint('Fatal error: $error\n$stack');
+  });
 }
 
 class PasteProApp extends StatefulWidget {
-  const PasteProApp({
-    super.key,
-    required this.overlayHeight,
-  });
-
-  final double overlayHeight;
+  const PasteProApp({super.key});
 
   @override
   State<PasteProApp> createState() => _PasteProAppState();
@@ -109,12 +53,10 @@ class PasteProApp extends StatefulWidget {
 
 class _PasteProAppState extends State<PasteProApp>
     with SingleTickerProviderStateMixin, WindowListener {
-  bool _isVisible = false;
   late final AnimationController _animationController;
   late final Animation<double> _slideAnimation;
   late final Animation<double> _fadeAnimation;
   late final VoidCallback _trayActivateHandler = () => unawaited(_toggleOverlay());
-  Timer? _clipboardMonitor;
 
   @override
   void initState() {
@@ -136,84 +78,37 @@ class _PasteProAppState extends State<PasteProApp>
     );
 
     windowManager.addListener(this);
-    unawaited(_initialiseTray());
-    unawaited(_registerHotKey());
-    _setupSignalHandling();
-    _startClipboardMonitoring();
+    _initializeServices();
+  }
+
+  Future<void> _initializeServices() async {
+    try {
+      await _initializeTray();
+      await _registerHotKey();
+      _setupSignalHandling();
+      ClipboardService.instance.startMonitoring();
+    } catch (e) {
+      debugPrint('Service initialization error: $e');
+    }
   }
 
   @override
   void dispose() {
-    _clipboardMonitor?.cancel();
+    ClipboardService.instance.dispose();
     _animationController.dispose();
     windowManager.removeListener(this);
     unawaited(hotKeyManager.unregister(_toggleHotKey));
     TrayBridge.instance.removeActivateHandler(_trayActivateHandler);
-    _removeLockFile();
+    SingleInstanceManager.instance.cleanup();
     super.dispose();
   }
 
-  void _startClipboardMonitoring() {
-    _clipboardMonitor = Timer.periodic(const Duration(seconds: 2), (timer) {
-      _checkClipboard();
-    });
-  }
-
-  Future<void> _checkClipboard() async {
-    try {
-      final data = await Clipboard.getData(Clipboard.kTextPlain);
-      if (data != null && data.text != null && data.text!.isNotEmpty) {
-        await _saveClipboardItem(data.text!, 'text');
-      }
-    } catch (e) {
-      // Clipboard access might fail, ignore
-      debugPrint('Clipboard check error: $e');
-    }
-  }
-
-  String? _lastClipboardContent;
-
-  Future<void> _saveClipboardItem(String content, String type) async {
-    // Avoid duplicates
-    if (content == _lastClipboardContent) return;
-    _lastClipboardContent = content;
-
-    await ClipboardDatabase.instance.insertItem({
-      'content': content,
-      'type': type,
-      'category': _categorizeContent(content),
-      'source_app': 'Unknown',
-      'created_at': DateTime.now().millisecondsSinceEpoch,
-    });
-  }
-
-  String _categorizeContent(String content) {
-    if (content.startsWith('http://') || content.startsWith('https://')) {
-      return 'links';
-    } else if (content.contains('struct') || content.contains('function') || content.contains('class')) {
-      return 'code';
-    } else if (content.length > 200) {
-      return 'notes';
-    }
-    return 'history';
-  }
-
-  Future<void> _removeLockFile() async {
-    try {
-      final appDir = await getApplicationDocumentsDirectory();
-      final lockFile = File(path.join(appDir.path, 'pastepro', '.lock'));
-      if (await lockFile.exists()) {
-        await lockFile.delete();
-      }
-    } catch (e) {
-      debugPrint('Failed to remove lock file: $e');
-    }
-  }
-
   void _setupSignalHandling() {
-    ProcessSignal.sigusr1.watch().listen((_) {
-      unawaited(_toggleOverlay());
-    });
+    if (Platform.isLinux) {
+      ProcessSignal.sigusr1.watch().listen((_) {
+        unawaited(_toggleOverlay());
+      });
+    }
   }
 
   Future<void> _registerHotKey() async {
@@ -222,19 +117,22 @@ class _PasteProAppState extends State<PasteProApp>
       return;
     }
 
-    await hotKeyManager.unregisterAll();
-    await hotKeyManager.register(
-      _toggleHotKey,
-      keyDownHandler: (_) => _toggleOverlay(),
-    );
+    try {
+      await hotKeyManager.unregisterAll();
+      await hotKeyManager.register(
+        _toggleHotKey,
+        keyDownHandler: (_) => _toggleOverlay(),
+      );
+    } catch (e) {
+      debugPrint('Hotkey registration error: $e');
+    }
   }
 
-  Future<void> _initialiseTray() async {
-    if (!Platform.isLinux) {
-      return;
-    }
-    final iconFile = File('assets/icons/clipboard.png');
+  Future<void> _initializeTray() async {
+    if (!Platform.isLinux) return;
+
     try {
+      final iconFile = File('assets/icons/clipboard.png');
       if (await iconFile.exists()) {
         await TrayBridge.instance.setIcon(
           iconFile.absolute.path,
@@ -242,58 +140,42 @@ class _PasteProAppState extends State<PasteProApp>
         );
       }
       TrayBridge.instance.addActivateHandler(_trayActivateHandler);
+      TrayBridge.instance.addExitHandler(() async {
+        // Gracefully hide instead of exiting the Flutter process.
+        await WindowService.instance.hide();
+        await SingleInstanceManager.instance.cleanup();
+      });
     } catch (error) {
-      debugPrint('Tray initialisation failed: $error');
+      debugPrint('Tray initialization failed: $error');
     }
   }
 
   Future<void> _toggleOverlay() async {
-    final bool currentlyVisible = await windowManager.isVisible();
-    if (currentlyVisible) {
-      await _animationController.reverse();
-      await windowManager.hide();
-      await windowManager.setAlwaysOnTop(false);
-    } else {
-      await _ensureBounds();
-      await windowManager.show();
-      await windowManager.setAlwaysOnTop(true);
-      await windowManager.focus();
-      await _animationController.forward();
+    try {
+      final currentlyVisible = await WindowService.instance.isVisible();
+      if (currentlyVisible) {
+        await _animationController.reverse();
+        await WindowService.instance.hide();
+      } else {
+        await WindowService.instance.show();
+        await _animationController.forward();
+      }
+    } catch (e) {
+      debugPrint('Toggle error: $e');
     }
-    if (mounted) {
-      setState(() => _isVisible = !currentlyVisible);
-    }
-  }
-
-  Future<void> _ensureBounds() async {
-    final display = await screenRetriever.getPrimaryDisplay();
-    final usableSize = display.visibleSize ?? display.size;
-    final origin = display.visiblePosition ?? Offset.zero;
-    final double overlayHeight = widget.overlayHeight;
-
-    await windowManager.setSize(
-      Size(usableSize.width, overlayHeight),
-      animate: false,
-    );
-    await windowManager.setPosition(
-      Offset(origin.dx, origin.dy + usableSize.height - overlayHeight),
-      animate: false,
-    );
-    await windowManager.setAlignment(Alignment.bottomCenter);
   }
 
   @override
   void onWindowBlur() {
     unawaited(_animationController.reverse().then((_) async {
-      await windowManager.hide();
-      if (mounted) {
-        setState(() => _isVisible = false);
-      }
+      await WindowService.instance.hide();
     }));
   }
 
   @override
   Widget build(BuildContext context) {
+    final overlayHeight = WindowService.instance.overlayHeight ?? 480;
+
     return MaterialApp(
       debugShowCheckedModeBanner: false,
       title: 'PastePro',
@@ -324,7 +206,7 @@ class _PasteProAppState extends State<PasteProApp>
           },
           child: Container(
             width: double.infinity,
-            height: widget.overlayHeight,
+            height: overlayHeight,
             decoration: BoxDecoration(
               gradient: LinearGradient(
                 begin: Alignment.topCenter,
@@ -365,14 +247,15 @@ class _OverlayContentState extends State<_OverlayContent> with SingleTickerProvi
   final TextEditingController _searchController = TextEditingController();
   final FocusNode _searchFocusNode = FocusNode();
   late TabController _tabController;
-  List<Map<String, dynamic>> _clipboardItems = [];
+  List<ClipboardItem> _clipboardItems = [];
+  String _searchQuery = '';
   String _selectedCategory = 'history';
 
   final List<Map<String, String>> _categories = [
-    {'id': 'history', 'name': 'Clipboard History', 'icon': '📋'},
-    {'id': 'links', 'name': 'Useful Links', 'icon': '🔗'},
-    {'id': 'notes', 'name': 'Important Notes', 'icon': '📝'},
-    {'id': 'code', 'name': 'Code Snippets', 'icon': '💻'},
+    {'id': 'history', 'name': 'History', 'icon': '📋'},
+    {'id': 'links', 'name': 'Links', 'icon': '🔗'},
+    {'id': 'notes', 'name': 'Notes', 'icon': '📝'},
+    {'id': 'code', 'name': 'Code', 'icon': '💻'},
   ];
 
   @override
@@ -397,12 +280,18 @@ class _OverlayContentState extends State<_OverlayContent> with SingleTickerProvi
   }
 
   Future<void> _loadClipboardItems() async {
-    final items = await ClipboardDatabase.instance.getItems(
-      category: _selectedCategory == 'history' ? null : _selectedCategory,
-    );
-    setState(() {
-      _clipboardItems = items;
-    });
+    try {
+      final items = await ClipboardService.instance.getItems(
+        category: _selectedCategory == 'history' ? null : _selectedCategory,
+      );
+      if (mounted) {
+        setState(() {
+          _clipboardItems = items;
+        });
+      }
+    } catch (e) {
+      debugPrint('Failed to load items: $e');
+    }
   }
 
   @override
@@ -418,7 +307,6 @@ class _OverlayContentState extends State<_OverlayContent> with SingleTickerProvi
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        // Header with tabs
         Row(
           children: [
             Container(
@@ -435,44 +323,63 @@ class _OverlayContentState extends State<_OverlayContent> with SingleTickerProvi
               child: const Icon(Icons.content_paste_rounded, size: 24, color: Color(0xFF64FFDA)),
             ),
             const SizedBox(width: 16),
-            const Text(
-              'PastePro',
-              style: TextStyle(
-                fontSize: 26,
-                fontWeight: FontWeight.w700,
-                color: Colors.white,
-                letterSpacing: -0.5,
+            Expanded(
+              child: Text(
+                'PastePro',
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(
+                  fontSize: 26,
+                  fontWeight: FontWeight.w700,
+                  color: Colors.white,
+                  letterSpacing: -0.5,
+                ),
               ),
             ),
-            const Spacer(),
-            Container(
-              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-              decoration: BoxDecoration(
-                color: Colors.white.withOpacity(0.06),
-                borderRadius: BorderRadius.circular(8),
-                border: Border.all(color: Colors.white.withOpacity(0.08)),
-              ),
-              child: Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Icon(Icons.keyboard, size: 14, color: Colors.white.withOpacity(0.6)),
-                  const SizedBox(width: 6),
-                  Text(
-                    'Ctrl+Shift+\\',
-                    style: TextStyle(
-                      color: Colors.white.withOpacity(0.7),
-                      fontSize: 12,
-                      fontWeight: FontWeight.w600,
+            const SizedBox(width: 8),
+            IconButton(
+              tooltip: 'Settings',
+              icon: const Icon(Icons.settings_outlined, color: Colors.white70),
+              onPressed: () {
+                showDialog(
+                  context: context,
+                  barrierColor: Colors.black54,
+                  builder: (_) => const SettingsPanel(),
+                );
+              },
+            ),
+            Flexible(
+              child: Container(
+                constraints: const BoxConstraints(maxWidth: 180),
+                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                decoration: BoxDecoration(
+                  color: Colors.white.withOpacity(0.06),
+                  borderRadius: BorderRadius.circular(8),
+                  border: Border.all(color: Colors.white.withOpacity(0.08)),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(Icons.keyboard, size: 14, color: Colors.white.withOpacity(0.6)),
+                    const SizedBox(width: 6),
+                    Flexible(
+                      child: Text(
+                        'Ctrl+Shift+\\',
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          color: Colors.white.withOpacity(0.7),
+                          fontSize: 12,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
                     ),
-                  ),
-                ],
+                  ],
+                ),
               ),
             ),
           ],
         ),
         const SizedBox(height: 20),
-
-        // Category tabs
         Container(
           height: 44,
           decoration: BoxDecoration(
@@ -482,6 +389,7 @@ class _OverlayContentState extends State<_OverlayContent> with SingleTickerProvi
           ),
           child: TabBar(
             controller: _tabController,
+            isScrollable: true,
             indicator: BoxDecoration(
               color: const Color(0xFF64FFDA).withOpacity(0.15),
               borderRadius: BorderRadius.circular(10),
@@ -507,8 +415,6 @@ class _OverlayContentState extends State<_OverlayContent> with SingleTickerProvi
           ),
         ),
         const SizedBox(height: 20),
-
-        // Search bar
         Container(
           decoration: BoxDecoration(
             color: Colors.white.withOpacity(0.04),
@@ -520,33 +426,43 @@ class _OverlayContentState extends State<_OverlayContent> with SingleTickerProvi
             focusNode: _searchFocusNode,
             style: const TextStyle(color: Colors.white, fontSize: 15),
             decoration: InputDecoration(
-              hintText: 'Search clipboard history...',
+              hintText: 'Search...',
               hintStyle: TextStyle(color: Colors.white.withOpacity(0.4), fontSize: 15),
               prefixIcon: Icon(Icons.search, color: Colors.white.withOpacity(0.4), size: 22),
               border: InputBorder.none,
               contentPadding: const EdgeInsets.symmetric(horizontal: 20, vertical: 16),
             ),
+            onChanged: (value) {
+              setState(() => _searchQuery = value.trim().toLowerCase());
+            },
           ),
         ),
         const SizedBox(height: 20),
-
-        // Clipboard items
         Expanded(
-          child: _clipboardItems.isEmpty
+          child: _filteredItems.isEmpty
               ? Center(
-                  child: Text(
-                    'No items yet',
-                    style: TextStyle(color: Colors.white.withOpacity(0.4)),
+                  child: Column(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      Icon(Icons.content_paste, size: 64, color: Colors.white.withOpacity(0.2)),
+                      const SizedBox(height: 16),
+                      Text(
+                        'No items yet',
+                        style: TextStyle(color: Colors.white.withOpacity(0.4), fontSize: 16),
+                      ),
+                      const SizedBox(height: 8),
+                      Text(
+                        'Copy something to get started',
+                        style: TextStyle(color: Colors.white.withOpacity(0.3), fontSize: 13),
+                      ),
+                    ],
                   ),
                 )
               : ListView.builder(
-                  itemCount: _clipboardItems.length,
+                  itemCount: _filteredItems.length,
                   itemBuilder: (context, index) {
-                    final item = _clipboardItems[index];
-                    return _ClipboardItemCard(
-                      item: item,
-                      onTap: () => _pasteItem(item),
-                    );
+                    final item = _filteredItems[index];
+                    return _ClipboardItemCard(item: item);
                   },
                 ),
         ),
@@ -554,20 +470,18 @@ class _OverlayContentState extends State<_OverlayContent> with SingleTickerProvi
     );
   }
 
-  void _pasteItem(Map<String, dynamic> item) {
-    debugPrint('Pasting: ${item['content']}');
-    // TODO: Implement paste functionality
+  List<ClipboardItem> get _filteredItems {
+    if (_searchQuery.isEmpty) return _clipboardItems;
+    return _clipboardItems
+        .where((e) => e.content.toLowerCase().contains(_searchQuery))
+        .toList();
   }
 }
 
 class _ClipboardItemCard extends StatefulWidget {
-  final Map<String, dynamic> item;
-  final VoidCallback onTap;
+  final ClipboardItem item;
 
-  const _ClipboardItemCard({
-    required this.item,
-    required this.onTap,
-  });
+  const _ClipboardItemCard({required this.item});
 
   @override
   State<_ClipboardItemCard> createState() => _ClipboardItemCardState();
@@ -578,103 +492,66 @@ class _ClipboardItemCardState extends State<_ClipboardItemCard> {
 
   @override
   Widget build(BuildContext context) {
-    final String content = widget.item['content'] as String;
-    final String type = widget.item['type'] as String;
-    final int timestamp = widget.item['created_at'] as int;
-
     return Padding(
       padding: const EdgeInsets.only(bottom: 12),
       child: MouseRegion(
         onEnter: (_) => setState(() => _isHovered = true),
         onExit: (_) => setState(() => _isHovered = false),
-        child: GestureDetector(
-          onTap: widget.onTap,
-          child: AnimatedContainer(
-            duration: const Duration(milliseconds: 150),
-            padding: const EdgeInsets.all(16),
-            decoration: BoxDecoration(
-              color: _isHovered
-                  ? Colors.white.withOpacity(0.08)
-                  : Colors.white.withOpacity(0.04),
-              borderRadius: BorderRadius.circular(14),
-              border: Border.all(
-                color: _isHovered
-                    ? Colors.white.withOpacity(0.12)
-                    : Colors.white.withOpacity(0.06),
-              ),
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 150),
+          padding: const EdgeInsets.all(16),
+          decoration: BoxDecoration(
+            color: _isHovered ? Colors.white.withOpacity(0.08) : Colors.white.withOpacity(0.04),
+            borderRadius: BorderRadius.circular(14),
+            border: Border.all(
+              color: _isHovered ? Colors.white.withOpacity(0.12) : Colors.white.withOpacity(0.06),
             ),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Row(
-                  children: [
-                    Icon(
-                      _getIconForType(type),
-                      size: 16,
-                      color: _getColorForType(type),
-                    ),
-                    const SizedBox(width: 8),
-                    Text(
-                      widget.item['source_app'] ?? 'Unknown',
-                      style: TextStyle(
-                        color: Colors.white.withOpacity(0.5),
-                        fontSize: 12,
-                        fontWeight: FontWeight.w500,
-                      ),
-                    ),
-                    const Spacer(),
-                    Text(
-                      _formatTimestamp(DateTime.fromMillisecondsSinceEpoch(timestamp)),
-                      style: TextStyle(
-                        color: Colors.white.withOpacity(0.4),
-                        fontSize: 11,
-                      ),
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 10),
-                Text(
-                  content,
-                  maxLines: 3,
-                  overflow: TextOverflow.ellipsis,
-                  style: const TextStyle(
-                    color: Colors.white,
-                    fontSize: 14,
-                    height: 1.5,
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  Icon(
+                    Icons.text_fields,
+                    size: 16,
+                    color: const Color(0xFF64FFDA),
                   ),
+                  const SizedBox(width: 8),
+                  Text(
+                    widget.item.sourceApp ?? 'Unknown',
+                    style: TextStyle(
+                      color: Colors.white.withOpacity(0.5),
+                      fontSize: 12,
+                      fontWeight: FontWeight.w500,
+                    ),
+                  ),
+                  const Spacer(),
+                  Text(
+                    _formatTimestamp(widget.item.createdAt),
+                    style: TextStyle(
+                      color: Colors.white.withOpacity(0.4),
+                      fontSize: 11,
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 10),
+              Text(
+                widget.item.content,
+                maxLines: 3,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(
+                  color: Colors.white,
+                  fontSize: 14,
+                  height: 1.5,
                 ),
-              ],
-            ),
+              ),
+            ],
           ),
         ),
       ),
     );
-  }
-
-  IconData _getIconForType(String type) {
-    switch (type) {
-      case 'text':
-        return Icons.text_fields;
-      case 'image':
-        return Icons.image;
-      case 'file':
-        return Icons.insert_drive_file;
-      default:
-        return Icons.content_paste;
-    }
-  }
-
-  Color _getColorForType(String type) {
-    switch (type) {
-      case 'text':
-        return const Color(0xFF64FFDA);
-      case 'image':
-        return const Color(0xFFFF7597);
-      case 'file':
-        return const Color(0xFF82AAFF);
-      default:
-        return Colors.white;
-    }
   }
 
   String _formatTimestamp(DateTime timestamp) {
@@ -700,6 +577,7 @@ class TrayBridge {
   static const MethodChannel _channel = MethodChannel('pastepro/tray');
 
   final List<VoidCallback> _activateHandlers = <VoidCallback>[];
+  final List<VoidCallback> _exitHandlers = <VoidCallback>[];
   bool _handlerAttached = false;
 
   Future<void> setIcon(String iconPath, {required String tooltip}) async {
@@ -721,9 +599,18 @@ class TrayBridge {
     _activateHandlers.remove(handler);
   }
 
+  void addExitHandler(VoidCallback handler) {
+    _exitHandlers.add(handler);
+  }
+
   Future<void> _handleMethodCall(MethodCall call) async {
     if (call.method == 'onActivate') {
       final callbacks = List<VoidCallback>.from(_activateHandlers);
+      for (final callback in callbacks) {
+        callback();
+      }
+    } else if (call.method == 'onExit') {
+      final callbacks = List<VoidCallback>.from(_exitHandlers);
       for (final callback in callbacks) {
         callback();
       }

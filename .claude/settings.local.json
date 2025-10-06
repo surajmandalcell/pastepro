@@ -1,0 +1,28 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(flutter run:*)",
+      "WebSearch",
+      "Bash(sudo pacman:*)",
+      "WebFetch(domain:pasteapp.io)",
+      "Bash(pkg-config:*)",
+      "Bash(pacman:*)",
+      "Bash(flutter clean:*)",
+      "Bash(nc localhost 45959)",
+      "Bash(gsettings:*)",
+      "Read(//home/suraj/.config/hypr/**)",
+      "Read(//home/suraj/.local/share/omarchy/default/hypr/bindings/**)",
+      "Bash(cat:*)",
+      "Bash(chmod:*)",
+      "Bash(hyprctl:*)",
+      "Bash(/home/suraj/dev/personal/pastepro/pastepro-toggle.sh:*)",
+      "Read(//home/suraj/**)",
+      "Bash(killall:*)",
+      "Bash(flutter pub:*)",
+      "Bash(mkdir:*)",
+      "Bash(flutter test:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}

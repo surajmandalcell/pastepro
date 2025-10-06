@@ -1,5 +1,4 @@
-import 'dart:io';
-import 'dart:math' as math';
+import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import 'package:screen_retriever/screen_retriever.dart';
 import 'package:window_manager/window_manager.dart';
