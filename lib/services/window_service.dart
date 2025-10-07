@@ -92,6 +92,8 @@ class WindowService {
     await windowManager.setSize(Size(usableSize.width, _overlayHeight!), animate: false);
     final y = origin.dy + usableSize.height - _overlayHeight!;
     await windowManager.setPosition(Offset(origin.dx, y), animate: false);
+    // Hint to place at bottom center where supported (X11). Wayland may ignore.
+    await windowManager.setAlignment(Alignment.bottomCenter);
   }
 
   double _chooseRatio(double h) {

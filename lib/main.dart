@@ -8,6 +8,7 @@ import 'package:hotkey_manager/hotkey_manager.dart';
 import 'package:window_manager/window_manager.dart';
 // screen_retriever is used within WindowService; not needed here
 import 'dart:ui';
+import 'package:screen_retriever/screen_retriever.dart';
 
 import 'models/clipboard_item.dart';
 import 'models/category.dart' as m;
@@ -182,9 +183,23 @@ class _PasteProAppState extends State<PasteProApp>
 
   @override
   void onWindowBlur() {
-    // On Wayland compositors like Hyprland, blur detection can be finicky.
-    // Fallback: hide on blur unconditionally to ensure click-outside hides.
-    unawaited(_animationController.reverse().then((_) => WindowService.instance.hide()));
+    // Only hide when user actually clicked outside our bounds; don't hide on arbitrary focus loss.
+    unawaited(_hideIfClickedOutside());
+  }
+
+  Future<void> _hideIfClickedOutside() async {
+    try {
+      final rect = await windowManager.getBounds();
+      // Delay a bit so pointer position reflects the click event that caused blur.
+      await Future.delayed(const Duration(milliseconds: 20));
+      final p = await screenRetriever.getCursorScreenPoint();
+      final inside = p.dx >= rect.left && p.dx <= rect.left + rect.width &&
+          p.dy >= rect.top && p.dy <= rect.top + rect.height;
+      if (!inside) {
+        await _animationController.reverse();
+        await WindowService.instance.hide();
+      }
+    } catch (_) {}
   }
 
   @override
@@ -378,10 +393,13 @@ class _OverlayContentState extends State<_OverlayContent> with SingleTickerProvi
                   style: TextStyle(color: AppTheme.textPrimary(context), fontSize: 14),
                   decoration: InputDecoration(
                     hintText: 'Search...',
+                    hintStyle: TextStyle(color: AppTheme.textTertiary(context)),
                     border: InputBorder.none,
+                    isDense: true,
                     prefixIcon: Icon(Icons.search, size: 18, color: AppTheme.textTertiary(context)),
-                    contentPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                    contentPadding: const EdgeInsets.symmetric(horizontal: 10),
                   ),
+                  textAlignVertical: TextAlignVertical.center,
                   onChanged: (value) => setState(() => _searchQuery = value.trim().toLowerCase()),
                 ),
               ),
